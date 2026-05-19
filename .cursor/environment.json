@@ -1,0 +1,6 @@
+{
+  "snapshot": "POPULATED_FROM_SETTINGS",
+  "install": "cd secretary && pip install -r requirements.txt && cd .. && npm install",
+  "start": "echo 'BGA ready. Read BGA_PROMPT.md for the operating manual.'",
+  "terminals": []
+}
