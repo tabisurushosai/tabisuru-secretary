@@ -4,7 +4,7 @@
 // 仕様書 docs/spec_v1_0.md §15 UX 方針:
 //   /qa は 4 セクション:
 //     1) 直近 7 日サマリー (実行回数 / バグ件数 / コスト)
-//     2) 未修正バグ一覧 (severity 降順)
+//     2) 未修正バグ一覧 (target グルーピング + 同種エラー集約)
 //     3) target 別最終結果 (10 ターゲットの状態を表で)
 //     4) 過去ラン履歴 (新しい順、クリックで詳細展開)
 //   既存 app/page.tsx のダーク背景・badge スタイルを踏襲。
@@ -320,10 +320,10 @@ async function loadQaDashboard(): Promise<DashboardData> {
 function ago(ts?: number): string {
   if (!ts) return '—';
   const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
+  if (s < 60) return `${s}秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)}分前`;
+  if (s < 86400) return `${Math.floor(s / 3600)}時間前`;
+  return `${Math.floor(s / 86400)}日前`;
 }
 
 function fmtUsd(v: number): string {
@@ -353,6 +353,20 @@ function severityBadgeClass(s: Severity): string {
   }
 }
 
+function severityLabel(s: Severity): string {
+  switch (s) {
+    case 'critical':
+      return '重大';
+    case 'major':
+      return '要対応';
+    case 'minor':
+      return '軽微';
+    case 'info':
+    default:
+      return '情報';
+  }
+}
+
 function runStatusBadgeClass(s: RunStatus): string {
   switch (s) {
     case 'completed':
@@ -365,9 +379,167 @@ function runStatusBadgeClass(s: RunStatus): string {
   }
 }
 
+function runStatusLabel(s: string): string {
+  switch (s) {
+    case 'completed':
+      return '完了';
+    case 'aborted':
+      return '中止';
+    case 'error':
+      return '失敗';
+    case 'running':
+      return '実行中';
+    default:
+      return s;
+  }
+}
+
 function shortRunId(runId: string): string {
   if (runId.length <= 10) return runId;
   return `${runId.slice(0, 6)}…${runId.slice(-4)}`;
+}
+
+// 英文エラー → 日本語サマリーへ簡易翻訳。
+// パターンマッチで頻出のテスト失敗メッセージを 1 行に要約。
+// 一致しない場合は原文の先頭 100 文字をそのまま返す。
+function translateError(text: string): string {
+  const s = (text || '').trim();
+  if (s.length === 0) return '(本文なし)';
+  if (/access to fetch at .* has been blocked by cors policy/i.test(s)) {
+    return '【CORS エラー】file:// 経由の fetch がブロックされた';
+  }
+  if (/net::err_file_not_found at chrome-extension:\/\//i.test(s)) {
+    return '【拡張ファイル未発見】popup.html / options.html がロード不可 (dist 未ビルドの可能性)';
+  }
+  if (/net::err_file_not_found/i.test(s)) {
+    return '【ファイル未発見】対象ファイルが存在しない';
+  }
+  if (/https:\/\/www\.google-analytics\.com\/g\/collect/i.test(s)) {
+    return '【GA 計測失敗】Google Analytics への送信が失敗 (AdBlock or CSP、ゲーム本体の動作には影響なし)';
+  }
+  if (/page\.goto:.*err_/i.test(s)) {
+    return '【ページ遷移失敗】page.goto でエラー、対象 URL が無効';
+  }
+  if (/page\.waitfortimeout:.*has been closed/i.test(s)) {
+    return '【ブラウザ強制終了】テスト中にブラウザが閉じられた';
+  }
+  if (/failed to load resource:.*status of 404/i.test(s)) {
+    return '【リンク先 404】参照先リソースが存在しない (リンク切れ)';
+  }
+  if (/chat-roundtrip:.*no signal/i.test(s)) {
+    return '【UI 検出失敗】チャット入力欄か送信ボタンが見つからない';
+  }
+  if (/\(no signal\)/i.test(s)) {
+    return '【シグナルなし】期待した要素や応答が検出できない';
+  }
+  if (/exception/i.test(s)) {
+    return '【例外発生】Playwright 操作中に例外がスローされた';
+  }
+  return s.length > 100 ? s.slice(0, 100) + '…' : s;
+}
+
+// バグから翻訳対象の英文を 1 つ抽出 (title 優先、なければ description / console_errors[0])。
+function extractBugErrorText(b: BugReport): string {
+  if (b.title && b.title.trim().length > 0) return b.title;
+  if (b.description && b.description.trim().length > 0) return b.description;
+  const ce = b.evidence?.console_errors;
+  if (ce && ce.length > 0) return ce[0];
+  return '';
+}
+
+// 1 行サマリー化 (原文を 80 文字に切って改行を除去、表示用)。
+function oneLineSummary(text: string, max = 80): string {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (s.length === 0) return '';
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+interface BugCluster {
+  key: string; // translateError 結果 (グルーピングキー)
+  bugs: BugReport[]; // このクラスタに属するバグ
+  topSeverity: Severity; // クラスタ内の最も重い severity
+  latestDetectedAt: number;
+  originalSample: string; // 1 行サマリー (代表バグの title)
+}
+
+interface TargetGroup {
+  target: string;
+  bugs: BugReport[];
+  clusters: BugCluster[];
+  topSeverity: Severity;
+}
+
+function buildTargetGroups(bugs: BugReport[]): TargetGroup[] {
+  const byTarget = new Map<string, BugReport[]>();
+  for (const b of bugs) {
+    const arr = byTarget.get(b.target);
+    if (arr === undefined) {
+      byTarget.set(b.target, [b]);
+    } else {
+      arr.push(b);
+    }
+  }
+
+  const groups: TargetGroup[] = [];
+  for (const [target, list] of byTarget) {
+    list.sort((a, b) => {
+      const o = SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
+      if (o !== 0) return o;
+      return b.detected_at - a.detected_at;
+    });
+
+    const clusterMap = new Map<string, BugReport[]>();
+    for (const b of list) {
+      const key = translateError(extractBugErrorText(b));
+      const arr = clusterMap.get(key);
+      if (arr === undefined) {
+        clusterMap.set(key, [b]);
+      } else {
+        arr.push(b);
+      }
+    }
+
+    const clusters: BugCluster[] = [];
+    for (const [key, list2] of clusterMap) {
+      let top: Severity = list2[0].severity;
+      let latest = 0;
+      for (const b of list2) {
+        if (SEVERITY_ORDER[b.severity] < SEVERITY_ORDER[top]) {
+          top = b.severity;
+        }
+        if (b.detected_at > latest) latest = b.detected_at;
+      }
+      const originalSample = oneLineSummary(extractBugErrorText(list2[0]));
+      clusters.push({
+        key,
+        bugs: list2,
+        topSeverity: top,
+        latestDetectedAt: latest,
+        originalSample,
+      });
+    }
+
+    clusters.sort((a, b) => {
+      const o = SEVERITY_ORDER[a.topSeverity] - SEVERITY_ORDER[b.topSeverity];
+      if (o !== 0) return o;
+      if (b.bugs.length !== a.bugs.length) return b.bugs.length - a.bugs.length;
+      return b.latestDetectedAt - a.latestDetectedAt;
+    });
+
+    groups.push({
+      target,
+      bugs: list,
+      clusters,
+      topSeverity: list[0].severity,
+    });
+  }
+
+  groups.sort((a, b) => {
+    if (b.bugs.length !== a.bugs.length) return b.bugs.length - a.bugs.length;
+    return SEVERITY_ORDER[a.topSeverity] - SEVERITY_ORDER[b.topSeverity];
+  });
+
+  return groups;
 }
 
 export default async function QaDashboard() {
@@ -377,6 +549,7 @@ export default async function QaDashboard() {
   const byTargetEntries: Array<[string, QASummaryByTargetEntry]> = summary
     ? Object.entries(summary.by_target).sort((a, b) => b[1].last_run - a[1].last_run)
     : [];
+  const targetGroups = buildTargetGroups(bugs);
 
   return (
     <main className="min-h-screen p-6 max-w-[1400px] mx-auto">
@@ -386,31 +559,28 @@ export default async function QaDashboard() {
             旅する書斎 <span className="text-text-secondary">QA</span>
           </h1>
           <p className="text-xs text-text-muted font-mono mt-1">
-            qa-secretary v1.0 · daily 03:00 JST · Playwright + Claude Sonnet 4.6 ·
-            Upstash Redis (read-only here)
+            qa-secretary v1.0 · 毎日 03:00 JST 自動実行 · Playwright + Claude Sonnet 4.6
           </p>
         </div>
         <div className="flex items-center gap-3">
           {criticalOpen > 0 && (
-            <span className="badge badge-red">
-              CRITICAL {criticalOpen}
-            </span>
+            <span className="badge badge-red">重大 {criticalOpen}</span>
           )}
           {majorOpen > 0 && (
-            <span className="badge badge-red">MAJOR {majorOpen}</span>
+            <span className="badge badge-red">要対応 {majorOpen}</span>
           )}
           {!error && criticalOpen === 0 && majorOpen === 0 && (
             <span className="badge badge-green">OK</span>
           )}
           <span className="text-xs text-text-muted font-mono">
-            summary: {ago(summary?.generated_at)}
+            サマリー更新: {ago(summary?.generated_at)}
           </span>
         </div>
       </header>
 
       {error && (
         <div className="panel border-accent-red/40 mb-6">
-          <div className="panel-title text-accent-red">REDIS ERROR</div>
+          <div className="panel-title text-accent-red">Redis エラー</div>
           <pre className="text-xs font-mono text-accent-red whitespace-pre-wrap">
             {error}
           </pre>
@@ -421,198 +591,265 @@ export default async function QaDashboard() {
         {/* §15 (1) 直近 7 日サマリー */}
         <section className="col-span-12 panel">
           <div className="panel-title flex justify-between">
-            <span>SUMMARY (last 7 days)</span>
+            <span>直近 7 日サマリー</span>
             <span className="text-text-muted">
               {summary
-                ? `30d window: ${summary.total_runs_30d} runs · ${fmtUsd(summary.cost_usd_30d)}`
-                : 'no summary cached yet'}
+                ? `30日: ${summary.total_runs_30d} 回 / ${fmtUsd(summary.cost_usd_30d)}`
+                : 'サマリー未生成'}
             </span>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
             <div className="bg-bg-card rounded p-3">
-              <div className="text-xs text-text-muted font-mono">RUNS 7d</div>
+              <div className="text-xs text-text-muted font-mono">実行 (7日)</div>
               <div className="text-2xl font-mono text-text-primary mt-1">
                 {recent7d.run_count}
               </div>
             </div>
             <div className="bg-bg-card rounded p-3">
-              <div className="text-xs text-text-muted font-mono">BUGS 7d</div>
+              <div className="text-xs text-text-muted font-mono">バグ (7日)</div>
               <div className="text-2xl font-mono text-text-primary mt-1">
                 {recent7d.bug_count}
               </div>
               <div className="text-xs text-text-muted font-mono mt-1">
-                fail {recent7d.fail_count}
+                失敗 {recent7d.fail_count} 件
               </div>
             </div>
             <div className="bg-bg-card rounded p-3">
-              <div className="text-xs text-text-muted font-mono">COST 7d</div>
+              <div className="text-xs text-text-muted font-mono">API コスト (7日)</div>
               <div className="text-2xl font-mono text-text-primary mt-1">
                 {fmtUsd(recent7d.cost_usd)}
               </div>
               <div className="text-xs text-text-muted font-mono mt-1">
-                limit $50 / 30d
+                上限 $50 / 30日
               </div>
             </div>
             <div className="bg-bg-card rounded p-3">
-              <div className="text-xs text-text-muted font-mono">BUGS open</div>
+              <div className="text-xs text-text-muted font-mono">未修正バグ</div>
               <div className="text-2xl font-mono text-text-primary mt-1">
                 {summary?.bugs_open ?? bugs.length}
               </div>
               <div className="text-xs text-text-muted font-mono mt-1">
-                critical {summary?.bugs_critical ?? criticalOpen}
+                重大 {summary?.bugs_critical ?? criticalOpen} 件
               </div>
             </div>
           </div>
         </section>
 
-        {/* §15 (2) 未修正バグ一覧 (severity 降順) */}
+        {/* §15 (2) 未修正バグ一覧 (target グルーピング + 同種エラー集約) */}
         <section className="col-span-12 panel">
           <div className="panel-title flex justify-between">
-            <span>OPEN BUGS</span>
-            <span className="text-text-muted">{bugs.length}</span>
+            <span>未修正バグ</span>
+            <span className="text-text-muted">{bugs.length} 件</span>
           </div>
-          {bugs.length === 0 ? (
+          {targetGroups.length === 0 ? (
             <p className="text-xs text-text-muted font-mono">
-              No open bugs. 🎉 (qa:bugs:active が空)
+              未修正バグはありません。🎉 (qa:bugs:active が空)
             </p>
           ) : (
             <ul className="space-y-2">
-              {bugs.map((b) => (
+              {targetGroups.map((group) => (
                 <li
-                  key={b.bug_id}
+                  key={group.target}
                   className="border border-line rounded bg-bg-card"
                 >
-                  <details>
+                  <details open>
                     <summary className="cursor-pointer p-3 text-xs font-mono">
-                      <span className={severityBadgeClass(b.severity)}>
-                        {b.severity}
+                      <span className="text-text-primary font-bold">
+                        {group.target}
                       </span>
-                      <span className="ml-2 text-text-primary">{b.target}</span>
-                      <span className="ml-2 text-text-secondary">
-                        {b.scenario_name}
-                      </span>
-                      <span className="ml-2 text-text-primary">{b.title}</span>
                       <span className="ml-2 text-text-muted">
-                        {ago(b.detected_at)}
+                        {group.bugs.length} 件
+                      </span>
+                      <span
+                        className={`ml-2 ${severityBadgeClass(group.topSeverity)}`}
+                      >
+                        {severityLabel(group.topSeverity)}
+                      </span>
+                      <span className="ml-2 text-text-muted">
+                        {group.clusters.length} 種類
                       </span>
                     </summary>
-                    <div className="px-3 pb-3 text-xs font-mono space-y-3">
-                      <div className="text-text-muted">
-                        bug_id: {b.bug_id} · run_id: {shortRunId(b.run_id)}
-                        {b.duplicate_of && (
-                          <span className="ml-2">
-                            duplicate_of: {b.duplicate_of}
-                          </span>
-                        )}
-                      </div>
-
-                      {b.description && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            description
-                          </div>
-                          <pre className="whitespace-pre-wrap text-text-primary">
-                            {b.description}
-                          </pre>
-                        </div>
-                      )}
-
-                      {b.evidence.console_errors.length > 0 && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            console_errors ({b.evidence.console_errors.length})
-                          </div>
-                          <pre className="whitespace-pre-wrap text-accent-red max-h-48 overflow-auto">
-                            {b.evidence.console_errors.join('\n')}
-                          </pre>
-                        </div>
-                      )}
-
-                      {b.evidence.network_errors.length > 0 && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            network_errors ({b.evidence.network_errors.length})
-                          </div>
-                          <ul className="space-y-1">
-                            {b.evidence.network_errors.map((ne, i) => (
-                              <li key={i} className="text-text-primary">
-                                <span className="text-accent-red">
-                                  [{ne.status_code}]
-                                </span>{' '}
-                                {ne.method} {ne.url}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-
-                      {b.evidence.reproduction_steps.length > 0 && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            reproduction_steps
-                          </div>
-                          <ol className="list-decimal list-inside space-y-0.5 text-text-primary">
-                            {b.evidence.reproduction_steps.map((step, i) => (
-                              <li key={i}>{step}</li>
-                            ))}
-                          </ol>
-                        </div>
-                      )}
-
-                      {b.evidence.screenshot_paths.length > 0 && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            screenshots (Mac 側 artifact パス、Vercel から実物は見えない)
-                          </div>
-                          <ul className="space-y-0.5">
-                            {b.evidence.screenshot_paths.map((p, i) => (
-                              <li key={i} className="text-text-muted">
-                                {p}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-
-                      <div className="border-t border-line pt-2">
-                        <div className="text-text-secondary mb-1">
-                          ai_analysis ({b.ai_analysis.model} · confidence{' '}
-                          {b.ai_analysis.confidence} ·{' '}
-                          {fmtUsd(b.ai_analysis.cost_usd)})
-                        </div>
-                        <pre className="whitespace-pre-wrap text-text-primary">
-                          {b.ai_analysis.root_cause}
-                        </pre>
-                      </div>
-
-                      {b.ai_analysis.suggested_fix.length > 0 && (
-                        <div>
-                          <div className="text-text-secondary mb-1">
-                            suggested_fix ({b.ai_analysis.suggested_fix.length})
-                          </div>
-                          <ul className="space-y-2">
-                            {b.ai_analysis.suggested_fix.map((fix, i) => (
-                              <li
-                                key={i}
-                                className="border border-line rounded p-2"
+                    <ul className="px-3 pb-3 space-y-2">
+                      {group.clusters.map((cluster, ci) => (
+                        <li
+                          key={ci}
+                          className="border border-line rounded bg-bg-panel"
+                        >
+                          <details>
+                            <summary className="cursor-pointer p-2 text-xs font-mono">
+                              <span
+                                className={severityBadgeClass(cluster.topSeverity)}
                               >
-                                <div className="text-text-primary mb-1">
-                                  {fix.file_path}
+                                {severityLabel(cluster.topSeverity)}
+                              </span>
+                              <span className="ml-2 text-text-primary font-bold">
+                                {cluster.key}
+                              </span>
+                              <span className="ml-2 text-text-muted">
+                                ({cluster.bugs.length} 件)
+                              </span>
+                              <span className="ml-2 text-text-muted">
+                                {ago(cluster.latestDetectedAt)}
+                              </span>
+                              {cluster.originalSample && (
+                                <div className="mt-1 text-text-muted/70 text-[10px] truncate">
+                                  原文: {cluster.originalSample}
                                 </div>
-                                <div className="text-text-muted mb-1">
-                                  {fix.description}
-                                </div>
-                                {fix.diff && (
-                                  <pre className="whitespace-pre-wrap text-text-primary bg-bg-panel rounded p-2 max-h-64 overflow-auto">
-                                    {fix.diff}
-                                  </pre>
-                                )}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
+                              )}
+                            </summary>
+                            <ul className="px-2 pb-2 space-y-2">
+                              {cluster.bugs.map((b) => (
+                                <li
+                                  key={b.bug_id}
+                                  className="border border-line rounded bg-bg-card"
+                                >
+                                  <details>
+                                    <summary className="cursor-pointer p-2 text-xs font-mono">
+                                      <span
+                                        className={severityBadgeClass(b.severity)}
+                                      >
+                                        {severityLabel(b.severity)}
+                                      </span>
+                                      <span className="ml-2 text-text-secondary">
+                                        {b.scenario_name}
+                                      </span>
+                                      <span className="ml-2 text-text-primary">
+                                        {oneLineSummary(b.title, 60) || '(no title)'}
+                                      </span>
+                                      <span className="ml-2 text-text-muted">
+                                        {ago(b.detected_at)}
+                                      </span>
+                                    </summary>
+                                    <div className="px-2 pb-2 text-xs font-mono space-y-3">
+                                      <div className="text-text-muted">
+                                        bug_id: {b.bug_id} · run_id:{' '}
+                                        {shortRunId(b.run_id)}
+                                        {b.duplicate_of && (
+                                          <span className="ml-2">
+                                            duplicate_of: {b.duplicate_of}
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {b.description && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            詳細 (原文)
+                                          </div>
+                                          <pre className="whitespace-pre-wrap text-text-primary">
+                                            {b.description}
+                                          </pre>
+                                        </div>
+                                      )}
+
+                                      {b.evidence.console_errors.length > 0 && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            コンソールエラー (
+                                            {b.evidence.console_errors.length})
+                                          </div>
+                                          <pre className="whitespace-pre-wrap text-accent-red max-h-48 overflow-auto">
+                                            {b.evidence.console_errors.join('\n')}
+                                          </pre>
+                                        </div>
+                                      )}
+
+                                      {b.evidence.network_errors.length > 0 && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            ネットワークエラー (
+                                            {b.evidence.network_errors.length})
+                                          </div>
+                                          <ul className="space-y-1">
+                                            {b.evidence.network_errors.map((ne, i) => (
+                                              <li key={i} className="text-text-primary">
+                                                <span className="text-accent-red">
+                                                  [{ne.status_code}]
+                                                </span>{' '}
+                                                {ne.method} {ne.url}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+
+                                      {b.evidence.reproduction_steps.length > 0 && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            再現手順
+                                          </div>
+                                          <ol className="list-decimal list-inside space-y-0.5 text-text-primary">
+                                            {b.evidence.reproduction_steps.map(
+                                              (step, i) => (
+                                                <li key={i}>{step}</li>
+                                              ),
+                                            )}
+                                          </ol>
+                                        </div>
+                                      )}
+
+                                      {b.evidence.screenshot_paths.length > 0 && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            スクリーンショット (Mac 側 artifact パス、Vercel から実物は見えない)
+                                          </div>
+                                          <ul className="space-y-0.5">
+                                            {b.evidence.screenshot_paths.map((p, i) => (
+                                              <li key={i} className="text-text-muted">
+                                                {p}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+
+                                      <div className="border-t border-line pt-2">
+                                        <div className="text-text-secondary mb-1">
+                                          AI 解析 ({b.ai_analysis.model} · 確信度{' '}
+                                          {b.ai_analysis.confidence} ·{' '}
+                                          {fmtUsd(b.ai_analysis.cost_usd)})
+                                        </div>
+                                        <pre className="whitespace-pre-wrap text-text-primary">
+                                          {b.ai_analysis.root_cause}
+                                        </pre>
+                                      </div>
+
+                                      {b.ai_analysis.suggested_fix.length > 0 && (
+                                        <div>
+                                          <div className="text-text-secondary mb-1">
+                                            修正案 ({b.ai_analysis.suggested_fix.length})
+                                          </div>
+                                          <ul className="space-y-2">
+                                            {b.ai_analysis.suggested_fix.map((fix, i) => (
+                                              <li
+                                                key={i}
+                                                className="border border-line rounded p-2"
+                                              >
+                                                <div className="text-text-primary mb-1">
+                                                  {fix.file_path}
+                                                </div>
+                                                <div className="text-text-muted mb-1">
+                                                  {fix.description}
+                                                </div>
+                                                {fix.diff && (
+                                                  <pre className="whitespace-pre-wrap text-text-primary bg-bg-panel rounded p-2 max-h-64 overflow-auto">
+                                                    {fix.diff}
+                                                  </pre>
+                                                )}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </details>
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        </li>
+                      ))}
+                    </ul>
                   </details>
                 </li>
               ))}
@@ -623,25 +860,23 @@ export default async function QaDashboard() {
         {/* §15 (3) target 別最終結果 */}
         <section className="col-span-12 panel">
           <div className="panel-title flex justify-between">
-            <span>TARGETS</span>
+            <span>プロジェクト別状況</span>
             <span className="text-text-muted">
-              {byTargetEntries.length} target
-              {byTargetEntries.length === 1 ? '' : 's'}
+              {byTargetEntries.length} プロジェクト
             </span>
           </div>
           {byTargetEntries.length === 0 ? (
             <p className="text-xs text-text-muted font-mono">
-              No target summary yet. (qa:summary が未生成 / Mac 側の最初の run
-              待ち)
+              プロジェクトサマリーがまだありません。(qa:summary が未生成 / Mac 側の最初の run 待ち)
             </p>
           ) : (
             <table className="w-full text-xs font-mono">
               <thead>
                 <tr className="text-text-muted text-left border-b border-line">
-                  <th className="py-1 pr-3">target</th>
-                  <th className="py-1 pr-3">runs (30d)</th>
-                  <th className="py-1 pr-3">bugs (30d)</th>
-                  <th className="py-1 pr-3">last run</th>
+                  <th className="py-1 pr-3">プロジェクト</th>
+                  <th className="py-1 pr-3">実行回数 (30日)</th>
+                  <th className="py-1 pr-3">バグ件数 (30日)</th>
+                  <th className="py-1 pr-3">最終実行</th>
                 </tr>
               </thead>
               <tbody>
@@ -675,12 +910,12 @@ export default async function QaDashboard() {
         {/* §15 (4) 過去ラン履歴 (新しい順、クリックで詳細展開) */}
         <section className="col-span-12 panel">
           <div className="panel-title flex justify-between">
-            <span>RUNS (recent {RUNS_DISPLAY_LIMIT})</span>
+            <span>実行履歴 (直近 {RUNS_DISPLAY_LIMIT} 件)</span>
             <span className="text-text-muted">{runs.length}</span>
           </div>
           {runs.length === 0 ? (
             <p className="text-xs text-text-muted font-mono">
-              No runs yet. (qa:runs:index が空)
+              実行履歴はまだありません。(qa:runs:index が空)
             </p>
           ) : (
             <ul className="space-y-2">
@@ -692,7 +927,7 @@ export default async function QaDashboard() {
                   <details>
                     <summary className="cursor-pointer p-3 text-xs font-mono">
                       <span className={runStatusBadgeClass(run.status)}>
-                        {run.status}
+                        {runStatusLabel(run.status)}
                       </span>
                       <span className="ml-2 text-text-primary">
                         {run.target}
@@ -701,17 +936,16 @@ export default async function QaDashboard() {
                         {run.target_kind}
                       </span>
                       <span className="ml-2 text-text-muted">
-                        {run.pass_count}/{run.scenario_count} pass
+                        {run.pass_count}/{run.scenario_count} 合格
                       </span>
                       {run.fail_count > 0 && (
                         <span className="ml-2 text-accent-red">
-                          {run.fail_count} fail
+                          失敗 {run.fail_count} 件
                         </span>
                       )}
                       {run.bugs.length > 0 && (
                         <span className="ml-2 text-accent-yellow">
-                          {run.bugs.length} bug
-                          {run.bugs.length === 1 ? '' : 's'}
+                          バグ {run.bugs.length} 件
                         </span>
                       )}
                       <span className="ml-2 text-text-muted">
@@ -730,25 +964,25 @@ export default async function QaDashboard() {
                       </div>
                       {run.abort_reason && (
                         <div className="text-accent-yellow">
-                          abort_reason: {run.abort_reason}
+                          中止理由: {run.abort_reason}
                         </div>
                       )}
                       {run.bugs.length > 0 ? (
                         <div>
                           <div className="text-text-secondary mb-1">
-                            bugs detected in this run
+                            この実行で検出されたバグ
                           </div>
                           <ul className="space-y-1">
                             {run.bugs.map((b) => (
                               <li key={b.bug_id}>
                                 <span className={severityBadgeClass(b.severity)}>
-                                  {b.severity}
+                                  {severityLabel(b.severity)}
                                 </span>
                                 <span className="ml-2 text-text-secondary">
                                   {b.scenario_name}
                                 </span>
                                 <span className="ml-2 text-text-primary">
-                                  {b.title}
+                                  {translateError(extractBugErrorText(b))}
                                 </span>
                                 <span className="ml-2 text-text-muted">
                                   ({b.status})
@@ -758,7 +992,7 @@ export default async function QaDashboard() {
                           </ul>
                         </div>
                       ) : (
-                        <p className="text-text-muted">No bugs in this run.</p>
+                        <p className="text-text-muted">この実行ではバグなし。</p>
                       )}
                     </div>
                   </details>
@@ -771,9 +1005,9 @@ export default async function QaDashboard() {
 
       <footer className="mt-8 pt-4 border-t border-line text-xs text-text-muted font-mono flex justify-between">
         <span>
-          qa-secretary v1.0 · Mac LaunchAgent (03:00 JST) + Upstash Redis (read-only)
+          qa-secretary v1.0 · Mac LaunchAgent (03:00 JST) + Upstash Redis
         </span>
-        <span>auto-refresh: 60s</span>
+        <span>自動更新: 60秒</span>
       </footer>
 
       <script
