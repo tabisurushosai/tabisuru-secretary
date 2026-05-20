@@ -6,7 +6,8 @@ export type ProcessKind =
   | 'codex_cli'
   | 'cursor_bga'
   | 'mac_secretary'
-  | 'github_cron';
+  | 'github_cron'
+  | 'orchestrator';
 
 export type ProcessStatus = 'running' | 'idle' | 'dead' | 'quota_exhausted';
 
@@ -39,7 +40,10 @@ export type ReleaseStage =
   | 'review'
   | 'published'
   | 'rejected'
-  | 'failed';
+  | 'failed'
+  // secretary:state adapter 由来の段階 (secretary_state_adapter.ts)
+  | 'ready'
+  | 'in_progress';
 
 export interface ProjectStatus {
   project: ProjectKind | string;
@@ -60,6 +64,9 @@ export interface MacState {
   disk_free_gb: number;
   processes: ProcessInfo[];
   projects: ProjectStatus[];
+  // secretary:state fallback 由来の付加情報 (既存の macState push には含まれない)
+  alerts?: Alert[];
+  automation?: Record<string, string>;
 }
 
 export interface Alert {

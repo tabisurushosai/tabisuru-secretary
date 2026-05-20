@@ -1,3 +1,4 @@
+import { headers } from 'next/headers';
 import { getRedis, K } from '@/lib/redis';
 import type { MacState, Alert, ProjectStatus, Command } from '@/lib/types';
 import { CommandPanel } from './CommandPanel';
@@ -26,6 +27,51 @@ async function loadState() {
   }
 }
 
+// /api/qa レスポンスの summary 部分 (qa-secretary v1.1)。
+interface QASummary {
+  total_runs_30d: number;
+  bugs_open: number;
+  bugs_critical: number;
+  cost_usd_30d: number;
+}
+
+// QA バグ検査サマリーを /api/qa から内部 fetch する。
+// Server Component から自分自身の API を叩くため絶対 URL + Basic 認証ヘッダ転送が必要。
+async function loadQAState() {
+  try {
+    const h = headers();
+    const host = h.get('host');
+    if (!host) {
+      return { qa: null as QASummary | null, qaError: 'host header 不明' };
+    }
+    const proto = h.get('x-forwarded-proto') ?? 'https';
+    const auth = h.get('authorization');
+    const res = await fetch(`${proto}://${host}/api/qa`, {
+      cache: 'no-store',
+      headers: auth ? { authorization: auth } : undefined,
+    });
+    if (!res.ok) {
+      return { qa: null as QASummary | null, qaError: `HTTP ${res.status}` };
+    }
+    const json = await res.json();
+    if (!json?.ok) {
+      return {
+        qa: null as QASummary | null,
+        qaError: json?.error ?? 'unknown error',
+      };
+    }
+    return {
+      qa: (json.summary ?? null) as QASummary | null,
+      qaError: null as string | null,
+    };
+  } catch (e) {
+    return {
+      qa: null as QASummary | null,
+      qaError: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 function ago(ts?: number): string {
   if (!ts) return '—';
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -36,7 +82,10 @@ function ago(ts?: number): string {
 }
 
 export default async function Dashboard() {
-  const { mac, alerts, queue, pending, error } = await loadState();
+  const [{ mac, alerts, queue, pending, error }, qaState] = await Promise.all([
+    loadState(),
+    loadQAState(),
+  ]);
   const criticalCount = alerts.filter((a) => a.severity === 'critical' && !a.resolved).length;
   const errorCount = alerts.filter((a) => a.severity === 'error' && !a.resolved).length;
 
@@ -221,6 +270,62 @@ export default async function Dashboard() {
         <section className="col-span-12 panel">
           <div className="panel-title">COMMANDS</div>
           <CommandPanel pending={pending} />
+        </section>
+
+        {/* QA バグ検査サマリー (qa-secretary v1.1 ページの統合表示) */}
+        <section className="col-span-12 lg:col-span-6 panel">
+          <div className="panel-title flex justify-between">
+            <span>QA バグ検査 (qa-secretary)</span>
+            {qaState.qa && qaState.qa.bugs_critical > 0 && (
+              <span className="badge badge-red">重大 {qaState.qa.bugs_critical}</span>
+            )}
+          </div>
+          {qaState.qaError ? (
+            <p className="text-xs text-text-muted">
+              QA データ取得失敗: {qaState.qaError}
+            </p>
+          ) : !qaState.qa ? (
+            <p className="text-xs text-text-muted">
+              No data. QA 秘書がまだ実行されていない可能性。
+            </p>
+          ) : (
+            <ul className="space-y-2 text-xs font-mono">
+              <li className="flex items-center justify-between">
+                <span className="text-text-secondary">直近30日のラン数</span>
+                <span className="text-text-primary">{qaState.qa.total_runs_30d}</span>
+              </li>
+              <li className="flex items-center justify-between">
+                <span className="text-text-secondary">未修正バグ (open)</span>
+                <span className="text-text-primary">{qaState.qa.bugs_open}</span>
+              </li>
+              <li className="flex items-center justify-between">
+                <span className="text-text-secondary">重大バグ (critical)</span>
+                <span
+                  className={
+                    qaState.qa.bugs_critical > 0
+                      ? 'badge badge-red'
+                      : 'badge badge-green'
+                  }
+                >
+                  {qaState.qa.bugs_critical}
+                </span>
+              </li>
+              <li className="flex items-center justify-between">
+                <span className="text-text-secondary">コスト (30日)</span>
+                <span className="text-text-primary">
+                  ${qaState.qa.cost_usd_30d.toFixed(2)}
+                </span>
+              </li>
+            </ul>
+          )}
+          <div className="mt-3">
+            <a
+              href="/qa"
+              className="text-xs font-mono text-text-secondary underline"
+            >
+              詳細を見る →
+            </a>
+          </div>
         </section>
       </div>
 

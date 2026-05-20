@@ -28,6 +28,9 @@ export const K = {
   heartbeat: (who: string) => `hb:${who}`, // who = mac_secretary / github_cron / bga / kosodate / etc
   // 全プロセス状態 (Mac 秘書が 5分毎に push)
   macState: 'state:mac',
+  // Mac 秘書 secretary_v1_0.sh が push する状態キー (snake_case JSON)。
+  // macState が空のときの fallback ソース。adapter で MacState 型に変換して読む。
+  secretaryState: 'secretary:state',
   // 各プロジェクトのリリース可否
   projectStatus: (project: string) => `project:${project}:status`,
   // 申請キュー
