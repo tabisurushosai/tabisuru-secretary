@@ -1,5 +1,6 @@
 import { headers } from 'next/headers';
 import { getRedis, K } from '@/lib/redis';
+import { adaptSecretaryState } from '@/lib/secretary_state_adapter';
 import type { MacState, Alert, ProjectStatus, Command } from '@/lib/types';
 import { CommandPanel } from './CommandPanel';
 
@@ -9,12 +10,22 @@ export const revalidate = 0;
 async function loadState() {
   try {
     const r = getRedis();
-    const [mac, alerts, queue, pending] = await Promise.all([
+    let [mac, alerts, queue, pending] = await Promise.all([
       r.get<MacState>(K.macState),
       r.lrange<Alert>(K.alerts, 0, 19),
       r.lrange<string>(K.releaseQueue, 0, 19),
       r.lrange<Command>(K.commands, 0, 19),
     ]);
+
+    // macState が null なら secretary:state を adapter 経由で読む (route.ts と同じ fallback)
+    if (!mac) {
+      const raw = await r.get<string | object>(K.secretaryState);
+      if (raw) {
+        const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        mac = adaptSecretaryState(obj);
+      }
+    }
+
     return { mac, alerts: alerts ?? [], queue: queue ?? [], pending: pending ?? [], error: null as string | null };
   } catch (e) {
     return {
