@@ -68,7 +68,14 @@ function toReleaseStage(p: SecretaryStateProject): ReleaseStage {
 export function adaptSecretaryState(raw: unknown): MacState | null {
   if (!isSecretaryState(raw)) return null;
 
-  const parsed = Date.parse(raw.updated_at);
+  // updated_at は Mac 秘書がタイムゾーン表記なしの JST naive 文字列
+  // (例 "2026-05-19T23:48:01.476031") で書き込む。Vercel (UTC) で new Date()
+  // すると UTC として解釈され約 9 時間ずれるため、明示的に +09:00 を付ける。
+  const iso =
+    raw.updated_at && !/[Z+]/.test(raw.updated_at)
+      ? raw.updated_at + '+09:00'
+      : raw.updated_at;
+  const parsed = iso ? Date.parse(iso) : NaN;
   const ts = Number.isNaN(parsed) ? Date.now() : parsed;
   const now = Date.now();
 

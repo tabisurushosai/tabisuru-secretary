@@ -146,7 +146,7 @@ export default async function Dashboard() {
         <section className="col-span-12 lg:col-span-6 panel">
           <div className="panel-title flex justify-between">
             <span>PROCESSES</span>
-            <span className="text-text-muted">{mac?.processes?.length ?? 0} active</span>
+            <span className="text-text-muted">{mac?.processes?.filter((p) => p.status === 'running').length ?? 0} active</span>
           </div>
           {!mac?.processes?.length ? (
             <p className="text-xs text-text-muted">No data. Mac 秘書が起動していない可能性。</p>
